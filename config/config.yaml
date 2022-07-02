@@ -1,0 +1,124 @@
+---
+passwd:
+  users:
+    - name: core
+      ssh_authorized_keys: ${ssh_keys}
+
+#########################################################################
+storage:
+  disks:
+    - device: "${root_disk}"
+      wipe_table: false
+      partitions:
+        - label: "${root_raid_name}-1"
+          number: 10
+          sizeMiB: 0
+          wipePartitionEntry: true
+          type_guid: be9067b9-ea49-4f15-b4f6-f36f8c9e1818
+    %{~ for index, device in raid_disks ~}
+    - device: ${device}
+      wipe_table: true
+      partitions:
+        - label: "${root_raid_name}-${index + 2}"
+          number: 1
+          sizeMiB: 0
+          type_guid: be9067b9-ea49-4f15-b4f6-f36f8c9e1818
+    %{~ endfor ~}
+  raid:
+    - name: "${root_raid_name}"
+      level: "${raid_level}"
+      devices:
+        - "/dev/disk/by-partlabel/${root_raid_name}-1"
+        %{~ for index, disk in raid_disks ~}
+        - "/dev/disk/by-partlabel/${root_raid_name}-${index + 2}"
+        %{~ endfor ~}
+  filesystems:
+    - name: "ROOT"
+      mount:
+        device: "/dev/md/${root_raid_name}"
+        format: "ext4"
+        label: "ROOT"
+    - name: "unused"
+      mount:
+        device: "${root_disk}-part9"
+        format: "ext4"
+        wipe_filesystem: true
+        label: "unused"
+  files:
+    - path: /etc/hostname
+      filesystem: root
+      mode: 0644
+      contents:
+        inline: ${hostname}
+
+    - path: /etc/systemd/resolved.conf.d/00-default-dns-servers.conf
+      filesystem: root
+      mode: 0644
+      contents:
+        inline: |
+          [Resolve]
+          DNS=${dns_servers}
+
+    - path: /etc/flatcar/update.conf
+      filesystem: root
+      mode: 0644
+      contents:
+        inline: |
+          GROUP=${update_group}
+          SERVER=${update_server}
+          MACHINE_ALIAS=${hostname}
+          REBOOT_STRATEGY=reboot
+
+    - path: /etc/crictl.yaml
+      filesystem: root
+      mode: 0644
+      contents:
+        inline: |
+          runtime-endpoint: unix:///run/containerd/containerd.sock
+
+    - path: /opt/bin/reprovision
+      filesystem: root
+      mode: 0755
+      contents:
+        inline: |
+          #!/bin/bash
+          set -euo pipefail
+          touch /usr/share/oem/grub.cfg
+          sed -i "/linux_append systemd.machine_id=.*/d" /usr/share/oem/grub.cfg
+          echo "set linux_append=\"\$linux_append systemd.machine_id=$(cat /etc/machine-id)\"" >> /usr/share/oem/grub.cfg
+          touch /boot/flatcar/first_boot
+
+#########################################################################
+networkd:
+  units:
+    - name: 00-eno3.network
+      contents: |
+        [Match]
+        Name=eno3
+
+        [Network]
+        DHCP=yes
+
+        [DHCPv4]
+        UseDNS=no
+
+        [DHCPv6]
+        UseDNS=no
+
+#########################################################################
+systemd:
+  units:
+    - name: update-engine.service
+      enabled: true
+
+    - name: locksmithd.service
+      mask: true
+
+    - name: containerd.service
+      enabled: true
+
+    - name: docker.socket
+      mask: true
+
+    - name: docker.service
+      mask: true

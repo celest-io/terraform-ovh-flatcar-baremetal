@@ -1,0 +1,89 @@
+---
+systemd:
+  units:
+    - name: installer.service
+      enabled: true
+      contents: |
+        [Unit]
+        Requires=network-online.target
+        After=network-online.target
+        [Service]
+        Type=oneshot
+        RemainAfterExit=true
+        Restart=on-failure
+        RestartSec=10s
+        ExecStart=/opt/installer
+        [Install]
+        WantedBy=multi-user.target
+    # Avoid using the standard SSH port so terraform apply cannot SSH until
+    # post-install. But admins may SSH to debug disk install problems.
+    # After install, sshd will use port 22 and users/terraform can connect.
+    - name: sshd.socket
+      dropins:
+        - name: 10-sshd-port.conf
+          contents: |
+            [Socket]
+            ListenStream=
+            ListenStream=2222
+storage:
+  files:
+    - path: /opt/installer
+      filesystem: root
+      mode: 0500
+      contents:
+        inline: |
+          #!/bin/bash -ex
+          # unmount any leftovers at the beginning before we modify the disk the mount uses
+          umount /tmp/oemfs || true
+          lvchange -an /dev/mapper/* || true
+          %{~ if wipe_additional_disks ~}
+          disks="$(lsblk -lnpdb -x SIZE -o NAME \
+            | (
+            while IFS= read -r drive; do
+              mountpoints=$(lsblk -ln -o MOUNTPOINT "$drive")
+              if [[ -z "$mountpoints" ]]; then
+                echo "$drive"
+              fi
+            done))"
+          for disk in $${disks}; do
+            wipefs -f -a "$${disk}" || echo "error: failed to wipe $${disk}"
+          done
+          %{~ endif ~}
+          %{~ if wipe_previous_raid ~}
+          for mddev in $(mdadm --detail --scan | awk '{print $2}')
+          do
+            devname=$(mdadm --detail $${mddev} | grep Name | awk '{print $3}')
+            mdadm --stop $${mddev}
+            for disk in $(lsblk -l -o name,label | grep $${devname} | awk '{print "/dev/"$1}')
+            do
+              mdadm --zero-superblock $${disk}
+            done
+          done
+          %{~ endif ~}
+          flatcar-install \
+            -d ${install_disk} \
+            -C ${os_channel} \
+            -V ${os_version} \
+            {{- if index . "baseurl"}}-b {{.baseurl}} \{{end}}
+            -V current
+          cgpt repair ${install_disk}
+          %{~ if raid_on_install_disk ~}
+          sgdisk --new=10:0:0 --change-name=10:${root_raid_name}-1 --typecode=10:be9067b9-ea49-4f15-b4f6-f36f8c9e1818 ${install_disk}
+          partprobe || true
+          %{~ endif ~}
+          udevadm settle
+          OEM_DEV="$(blkid -t "LABEL=OEM" -o device)"
+          mkdir -p /tmp/oemfs
+          mount "$${OEM_DEV}" /tmp/oemfs
+          # append to file on newly created partition, do not remove the defaults
+          echo 'set linux_append="ignition.config.url=${ignition_endpoint}?mac=${mac_address}&os=installed"' >> /tmp/oemfs/grub.cfg
+          %{~ if kernel_args  != "" ~}
+          echo 'set linux_append="$linux_append ${kernel_args}"' >> /tmp/oemfs/grub.cfg
+          %{~ endif ~}
+          echo 'set linux_console="${kernel_console}"' >> /tmp/oemfs/grub.cfg
+          umount /tmp/oemfs
+          systemctl reboot
+passwd:
+  users:
+    - name: core
+      ssh_authorized_keys: ${ssh_keys}
